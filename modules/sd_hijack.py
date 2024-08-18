@@ -1,13 +1,4 @@
 class StableDiffusionModelHijack:
-    fixes = None
-    layers = None
-    circular_enabled = False
-    clip = None
-    optimization_method = None
-
-    def __init__(self):
-        self.extra_generation_params = {}
-        self.comments = []
 
     def apply_optimizations(self, option=None):
         pass
@@ -25,11 +16,11 @@ class StableDiffusionModelHijack:
         pass
 
     def clear_comments(self):
-        self.comments = []
-        self.extra_generation_params = {}
+        pass
 
     def get_prompt_lengths(self, text, cond_stage_model):
-        pass
+        from modules import shared
+        return shared.sd_model.get_prompt_lengths_on_ui(text)
 
     def redo_hijack(self, m):
         pass

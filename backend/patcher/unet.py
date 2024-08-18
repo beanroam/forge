@@ -3,21 +3,18 @@ import torch
 
 from backend.modules.k_model import KModel
 from backend.patcher.base import ModelPatcher
-from backend import memory_management
 
 
 class UnetPatcher(ModelPatcher):
     @classmethod
-    def from_model(cls, model, diffusers_scheduler):
-        parameters = memory_management.module_size(model)
-        unet_dtype = memory_management.unet_dtype(model_params=parameters)
-        load_device = memory_management.get_torch_device()
-        initial_load_device = memory_management.unet_inital_load_device(parameters, unet_dtype)
-        manual_cast_dtype = memory_management.unet_manual_cast(unet_dtype, load_device)
-        manual_cast_dtype = unet_dtype if manual_cast_dtype is None else manual_cast_dtype
-        model.to(device=initial_load_device, dtype=unet_dtype)
-        model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, storage_dtype=unet_dtype, computation_dtype=manual_cast_dtype)
-        return UnetPatcher(model, load_device=load_device, offload_device=memory_management.unet_offload_device(), current_device=initial_load_device)
+    def from_model(cls, model, diffusers_scheduler, config, k_predictor=None):
+        model = KModel(model=model, diffusers_scheduler=diffusers_scheduler, k_predictor=k_predictor, config=config)
+        return UnetPatcher(
+            model,
+            load_device=model.diffusion_model.load_device,
+            offload_device=model.diffusion_model.offload_device,
+            current_device=model.diffusion_model.initial_device
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -27,13 +24,7 @@ class UnetPatcher(ModelPatcher):
         self.extra_concat_condition = None
 
     def clone(self):
-        n = UnetPatcher(self.model, self.load_device, self.offload_device, self.size, self.current_device,
-                        weight_inplace_update=self.weight_inplace_update)
-
-        n.patches = {}
-        for k in self.patches:
-            n.patches[k] = self.patches[k][:]
-
+        n = UnetPatcher(self.model, self.load_device, self.offload_device, self.size, self.current_device)
         n.object_patches = self.object_patches.copy()
         n.model_options = copy.deepcopy(self.model_options)
         n.controlnet_linked_list = self.controlnet_linked_list
@@ -170,8 +161,8 @@ class UnetPatcher(ModelPatcher):
         self.append_transformer_option('controlnet_conditioning_modifiers', modifier, ensure_uniqueness)
         return
 
-    def set_groupnorm_wrapper(self, wrapper):
-        self.set_transformer_option('groupnorm_wrapper', wrapper)
+    def set_group_norm_wrapper(self, wrapper):
+        self.set_transformer_option('group_norm_wrapper', wrapper)
         return
 
     def set_controlnet_model_function_wrapper(self, wrapper):
@@ -200,5 +191,6 @@ class UnetPatcher(ModelPatcher):
             for patch_type, weight_list in v.items():
                 patch_flat[model_key] = (patch_type, weight_list)
 
-        self.add_patches(patches=patch_flat, strength_patch=float(strength), strength_model=1.0)
+        self.lora_loader.clear_patches()
+        self.lora_loader.add_patches(patches=patch_flat, strength_patch=float(strength), strength_model=1.0)
         return

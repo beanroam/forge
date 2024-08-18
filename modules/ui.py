@@ -24,9 +24,9 @@ from modules.shared import opts, cmd_opts
 import modules.infotext_utils as parameters_copypaste
 import modules.shared as shared
 from modules import prompt_parser
-from modules.sd_hijack import model_hijack
 from modules.infotext_utils import image_from_url_text, PasteField
 from modules_forge.forge_canvas.canvas import ForgeCanvas, canvas_head
+from modules_forge import main_entry, forge_space
 
 
 create_setting_component = ui_settings.create_setting_component
@@ -307,7 +307,10 @@ def create_ui():
 
                     elif category == "cfg":
                         with gr.Row():
+                            distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, label='Distilled CFG Scale', value=3.5, elem_id="txt2img_distilled_cfg_scale")
+                        with gr.Row():
                             cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='CFG Scale', value=7.0, elem_id="txt2img_cfg_scale")
+                            cfg_scale.change(lambda x: gr.update(interactive=(x != 1)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
 
                     elif category == "checkboxes":
                         with FormRow(elem_classes="checkboxes-row", variant="compact"):
@@ -329,15 +332,15 @@ def create_ui():
                                     hr_resize_x = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize width to", value=0, elem_id="txt2img_hr_resize_x")
                                     hr_resize_y = gr.Slider(minimum=0, maximum=2048, step=8, label="Resize height to", value=0, elem_id="txt2img_hr_resize_y")
 
-                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact", visible=opts.hires_fix_show_sampler) as hr_sampler_container:
+                                with FormRow(elem_id="txt2img_hires_fix_row3", variant="compact") as hr_sampler_container:
 
-                                    hr_checkpoint_name = gr.Dropdown(label='Checkpoint', elem_id="hr_checkpoint", choices=["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True), value="Use same checkpoint")
-                                    create_refresh_button(hr_checkpoint_name, modules.sd_models.list_models, lambda: {"choices": ["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)}, "hr_checkpoint_refresh")
+                                    hr_checkpoint_name = gr.Dropdown(label='Checkpoint', elem_id="hr_checkpoint", choices=["Use same checkpoint"], value="Use same checkpoint", visible=False, interactive=False)
+                                    # create_refresh_button(hr_checkpoint_name, modules.sd_models.list_models, lambda: {"choices": ["Use same checkpoint"] + modules.sd_models.checkpoint_tiles(use_short=True)}, "hr_checkpoint_refresh")
 
                                     hr_sampler_name = gr.Dropdown(label='Hires sampling method', elem_id="hr_sampler", choices=["Use same sampler"] + sd_samplers.visible_sampler_names(), value="Use same sampler")
                                     hr_scheduler = gr.Dropdown(label='Hires schedule type', elem_id="hr_scheduler", choices=["Use same scheduler"] + [x.label for x in sd_schedulers.schedulers], value="Use same scheduler")
 
-                                with FormRow(elem_id="txt2img_hires_fix_row4", variant="compact", visible=opts.hires_fix_show_prompts) as hr_prompts_container:
+                                with FormRow(elem_id="txt2img_hires_fix_row4", variant="compact") as hr_prompts_container:
                                     with gr.Column(scale=80):
                                         with gr.Row():
                                             hr_prompt = gr.Textbox(label="Hires prompt", elem_id="hires_prompt", show_label=False, lines=3, placeholder="Prompt for hires fix pass.\nLeave empty to use the same prompt as in first pass.", elem_classes=["prompt"])
@@ -393,6 +396,7 @@ def create_ui():
                 batch_count,
                 batch_size,
                 cfg_scale,
+                distilled_cfg_scale,
                 height,
                 width,
                 enable_hr,
@@ -456,6 +460,7 @@ def create_ui():
                 PasteField(toprow.prompt, "Prompt", api="prompt"),
                 PasteField(toprow.negative_prompt, "Negative prompt", api="negative_prompt"),
                 PasteField(cfg_scale, "CFG scale", api="cfg_scale"),
+                PasteField(distilled_cfg_scale, "Distilled CFG Scale", api="distilled_cfg_scale"),
                 PasteField(width, "Size-1", api="width"),
                 PasteField(height, "Size-2", api="height"),
                 PasteField(batch_size, "Batch size", api="batch_size"),
@@ -482,17 +487,6 @@ def create_ui():
             ))
 
             steps = scripts.scripts_txt2img.script('Sampler').steps
-
-            txt2img_preview_params = [
-                toprow.prompt,
-                toprow.negative_prompt,
-                steps,
-                scripts.scripts_txt2img.script('Sampler').sampler_name,
-                cfg_scale,
-                scripts.scripts_txt2img.script('Seed').seed,
-                width,
-                height,
-            ]
 
             toprow.ui_styles.dropdown.change(fn=wrap_queued_call(update_token_counter), inputs=[toprow.prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.token_counter])
             toprow.ui_styles.dropdown.change(fn=wrap_queued_call(update_negative_prompt_token_counter), inputs=[toprow.negative_prompt, steps, toprow.ui_styles.dropdown], outputs=[toprow.negative_token_counter])
@@ -654,8 +648,11 @@ def create_ui():
 
                     elif category == "cfg":
                         with gr.Row():
+                            distilled_cfg_scale = gr.Slider(minimum=0.0, maximum=30.0, step=0.5, label='Distilled CFG Scale', value=3.5, elem_id="img2img_distilled_cfg_scale")
+                        with gr.Row():
                             cfg_scale = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='CFG Scale', value=7.0, elem_id="img2img_cfg_scale")
                             image_cfg_scale = gr.Slider(minimum=0, maximum=3.0, step=0.05, label='Image CFG Scale', value=1.5, elem_id="img2img_image_cfg_scale", visible=False)
+                            cfg_scale.change(lambda x: gr.update(interactive=(x != 1)), inputs=[cfg_scale], outputs=[toprow.negative_prompt], queue=False, show_progress=False)
 
                     elif category == "checkboxes":
                         with FormRow(elem_classes="checkboxes-row", variant="compact"):
@@ -734,6 +731,7 @@ def create_ui():
                 batch_count,
                 batch_size,
                 cfg_scale,
+                distilled_cfg_scale,
                 image_cfg_scale,
                 denoising_strength,
                 selected_scale_tab,
@@ -830,6 +828,7 @@ def create_ui():
                 (toprow.prompt, "Prompt"),
                 (toprow.negative_prompt, "Negative prompt"),
                 (cfg_scale, "CFG scale"),
+                (distilled_cfg_scale, "Distilled CFG Scale"),
                 (image_cfg_scale, "Image CFG scale"),
                 (width, "Size-1"),
                 (height, "Size-2"),
@@ -853,6 +852,9 @@ def create_ui():
         ui_extra_networks.setup_ui(extra_networks_ui_img2img, output_panel.gallery)
 
         extra_tabs.__exit__()
+
+    with gr.Blocks(analytics_enabled=False, head=canvas_head) as space_interface:
+        forge_space.main_entry()
 
     scripts.scripts_current = None
 
@@ -890,8 +892,9 @@ def create_ui():
     settings.create_ui(loadsave, dummy_component)
 
     interfaces = [
-        (txt2img_interface, "txt2img", "txt2img"),
-        (img2img_interface, "img2img", "img2img"),
+        (txt2img_interface, "Txt2img", "txt2img"),
+        (img2img_interface, "Img2img", "img2img"),
+        (space_interface, "Spaces", "space"),
         (extras_interface, "Extras", "extras"),
         (pnginfo_interface, "PNG Info", "pnginfo"),
         (modelmerger_ui.blocks, "Checkpoint Merger", "modelmerger"),
@@ -938,11 +941,13 @@ def create_ui():
 
         settings.add_functionality(demo)
 
-        update_image_cfg_scale_visibility = lambda: gr.update(visible=shared.sd_model and shared.sd_model.cond_stage_key == "edit")
+        update_image_cfg_scale_visibility = lambda: gr.update(visible=False)
         settings.text_settings.change(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
         demo.load(fn=update_image_cfg_scale_visibility, inputs=[], outputs=[image_cfg_scale])
 
-        modelmerger_ui.setup_ui(dummy_component=dummy_component, sd_model_checkpoint_component=settings.component_dict['sd_model_checkpoint'])
+        modelmerger_ui.setup_ui(dummy_component=dummy_component, sd_model_checkpoint_component=main_entry.ui_checkpoint)
+
+        main_entry.forge_main_entry()
 
     if ui_settings_from_file != loadsave.ui_settings:
         loadsave.dump_defaults()

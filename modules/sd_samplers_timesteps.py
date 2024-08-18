@@ -28,43 +28,24 @@ class CompVisTimestepsDenoiser(torch.nn.Module):
     def __init__(self, model, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.inner_model = model
+        self.inner_model.alphas_cumprod = 1.0 / (self.inner_model.forge_objects.unet.model.predictor.sigmas ** 2.0 + 1.0)
 
     def forward(self, input, timesteps, **kwargs):
         return self.inner_model.apply_model(input, timesteps, **kwargs)
 
 
-class CompVisTimestepsVDenoiser(torch.nn.Module):
-    def __init__(self, model, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.inner_model = model
-
-    def predict_eps_from_z_and_v(self, x_t, t, v):
-        return torch.sqrt(self.inner_model.alphas_cumprod)[t.to(torch.int), None, None, None] * v + torch.sqrt(1 - self.inner_model.alphas_cumprod)[t.to(torch.int), None, None, None] * x_t
-
-    def forward(self, input, timesteps, **kwargs):
-        model_output = self.inner_model.apply_model(input, timesteps, **kwargs)
-        e_t = self.predict_eps_from_z_and_v(input, timesteps, model_output)
-        return e_t
-
-
 class CFGDenoiserTimesteps(CFGDenoiser):
 
-    def __init__(self, sampler, model):
-        super().__init__(sampler, model)
-
-        self.alphas = model.forge_objects.unet.model.predictor.alphas_cumprod
+    def __init__(self, sampler):
+        super().__init__(sampler)
         self.classic_ddim_eps_estimation = True
 
-    def get_pred_x0(self, x_in, x_out, sigma):
-        ts = sigma.to(dtype=int)
-        self.alphas = self.alphas.to(ts.device)
+    @property
+    def inner_model(self):
+        if self.model_wrap is None:
+            self.model_wrap = CompVisTimestepsDenoiser(shared.sd_model)
 
-        a_t = self.alphas[ts][:, None, None, None]
-        sqrt_one_minus_at = (1 - a_t).sqrt()
-
-        pred_x0 = (x_in - sqrt_one_minus_at * x_out) / a_t.sqrt()
-
-        return pred_x0
+        return self.model_wrap
 
 
 class CompVisSampler(sd_samplers_common.Sampler):
@@ -75,10 +56,8 @@ class CompVisSampler(sd_samplers_common.Sampler):
         self.eta_infotext_field = 'Eta DDIM'
         self.eta_default = 0.0
 
-        self.model_wrap = self.model_wrap_cfg = CFGDenoiserTimesteps(self, sd_model)
-        self.predictor = sd_model.forge_objects.unet.model.predictor
-
-        self.model_wrap.inner_model.alphas_cumprod = self.predictor.alphas_cumprod
+        self.model_wrap_cfg = CFGDenoiserTimesteps(self)
+        self.model_wrap = self.model_wrap_cfg.inner_model
 
     def get_timesteps(self, p, steps):
         discard_next_to_last_sigma = self.config is not None and self.config.options.get('discard_next_to_last_sigma', False)

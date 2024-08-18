@@ -1,11 +1,13 @@
 import torch
 import inspect
 import k_diffusion.sampling
-from modules import sd_samplers_common, sd_samplers_extra, sd_schedulers, devices
-from modules.sd_samplers_cfg_denoiser import CFGDenoiser
+import k_diffusion.external
+from modules import sd_samplers_common, sd_samplers_extra, sd_samplers_cfg_denoiser, sd_schedulers, devices
+from modules.sd_samplers_cfg_denoiser import CFGDenoiser  # noqa: F401
 from modules.script_callbacks import ExtraNoiseParams, extra_noise_callback
 
 from modules.shared import opts
+import modules.shared as shared
 from backend.sampling.sampling_function import sampling_prepare, sampling_cleanup
 
 
@@ -50,6 +52,16 @@ k_diffusion_samplers_map = {x.name: x for x in samplers_data_k_diffusion}
 k_diffusion_scheduler = {x.name: x.function for x in sd_schedulers.schedulers}
 
 
+class CFGDenoiserKDiffusion(sd_samplers_cfg_denoiser.CFGDenoiser):
+    @property
+    def inner_model(self):
+        if self.model_wrap is None:
+            self.model_wrap = k_diffusion.external.ForgeScheduleLinker(shared.sd_model.forge_objects.unet.model.predictor)
+            self.model_wrap.inner_model = shared.sd_model
+
+        return self.model_wrap
+
+
 class KDiffusionSampler(sd_samplers_common.Sampler):
     def __init__(self, funcname, sd_model, options=None):
         super().__init__(funcname)
@@ -59,11 +71,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         self.options = options or {}
         self.func = funcname if callable(funcname) else getattr(k_diffusion.sampling, self.funcname)
 
-        self.model_wrap = self.model_wrap_cfg = CFGDenoiser(self, sd_model)
-        self.predictor = sd_model.forge_objects.unet.model.predictor
-
-        self.model_wrap_cfg.sigmas = self.predictor.sigmas
-        self.model_wrap_cfg.log_sigmas = self.predictor.sigmas.log()
+        self.model_wrap_cfg = CFGDenoiserKDiffusion(self)
+        self.model_wrap = self.model_wrap_cfg.inner_model
 
     def get_sigmas(self, p, steps):
         discard_next_to_last_sigma = self.config is not None and self.config.options.get('discard_next_to_last_sigma', False)
@@ -79,7 +88,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         scheduler = sd_schedulers.schedulers_map.get(scheduler_name)
 
-        m_sigma_min, m_sigma_max = self.predictor.sigmas[0].item(), self.predictor.sigmas[-1].item()
+        m_sigma_min, m_sigma_max = self.model_wrap.sigmas[0].item(), self.model_wrap.sigmas[-1].item()
         sigma_min, sigma_max = (0.1, 10) if opts.use_old_karras_scheduler_sigmas else (m_sigma_min, m_sigma_max)
 
         if p.sampler_noise_scheduler_override:
@@ -107,7 +116,7 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
                 p.extra_generation_params["Schedule rho"] = opts.rho
 
             if scheduler.need_inner_model:
-                sigmas_kwargs['inner_model'] = self.model_wrap_cfg
+                sigmas_kwargs['inner_model'] = self.model_wrap
 
             if scheduler.label == 'Beta':
                 p.extra_generation_params["Beta schedule alpha"] = opts.beta_dist_alpha
@@ -121,11 +130,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         return sigmas.cpu()
 
     def sample_img2img(self, p, x, noise, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
-        unet_patcher = self.model_wrap_cfg.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap_cfg.inner_model.forge_objects.unet, x=x)
-
-        self.model_wrap_cfg.sigmas = self.model_wrap_cfg.sigmas.to(x.device)
-        self.model_wrap_cfg.log_sigmas = self.model_wrap_cfg.log_sigmas.to(x.device)
+        unet_patcher = self.model_wrap.inner_model.forge_objects.unet
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x)
 
         steps, t_enc = sd_samplers_common.setup_img2img_steps(p, steps)
 
@@ -133,7 +139,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         sigma_sched = sigmas[steps - t_enc - 1:]
 
         x = x.to(noise)
-        xi = x + noise * sigma_sched[0]
+
+        xi = self.model_wrap.predictor.noise_scaling(sigma_sched[0], noise, x, max_denoise=False)
 
         if opts.img2img_extra_noise > 0:
             p.extra_generation_params["Extra noise"] = opts.img2img_extra_noise
@@ -183,11 +190,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
         return samples
 
     def sample(self, p, x, conditioning, unconditional_conditioning, steps=None, image_conditioning=None):
-        unet_patcher = self.model_wrap_cfg.inner_model.forge_objects.unet
-        sampling_prepare(self.model_wrap_cfg.inner_model.forge_objects.unet, x=x)
-
-        self.model_wrap_cfg.sigmas = self.model_wrap_cfg.sigmas.to(x.device)
-        self.model_wrap_cfg.log_sigmas = self.model_wrap_cfg.log_sigmas.to(x.device)
+        unet_patcher = self.model_wrap.inner_model.forge_objects.unet
+        sampling_prepare(self.model_wrap.inner_model.forge_objects.unet, x=x)
 
         steps = steps or p.steps
 
@@ -195,9 +199,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
 
         if opts.sgm_noise_multiplier:
             p.extra_generation_params["SGM noise multiplier"] = True
-            x = x * torch.sqrt(1.0 + sigmas[0] ** 2.0)
-        else:
-            x = x * sigmas[0]
+
+        x = self.model_wrap.predictor.noise_scaling(sigmas[0], x, torch.zeros_like(x), max_denoise=opts.sgm_noise_multiplier)
 
         extra_params_kwargs = self.initialize(p)
         parameters = inspect.signature(self.func).parameters
@@ -206,8 +209,8 @@ class KDiffusionSampler(sd_samplers_common.Sampler):
             extra_params_kwargs['n'] = steps
 
         if 'sigma_min' in parameters:
-            extra_params_kwargs['sigma_min'] = self.model_wrap_cfg.sigmas[0].item()
-            extra_params_kwargs['sigma_max'] = self.model_wrap_cfg.sigmas[-1].item()
+            extra_params_kwargs['sigma_min'] = self.model_wrap.sigmas[0].item()
+            extra_params_kwargs['sigma_max'] = self.model_wrap.sigmas[-1].item()
 
         if 'sigmas' in parameters:
             extra_params_kwargs['sigmas'] = sigmas

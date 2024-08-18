@@ -5,7 +5,82 @@ from backend.misc import image_resize
 from backend import memory_management, state_dict, utils
 from backend.nn.cnets import cldm, t2i_adapter
 from backend.patcher.base import ModelPatcher
-from backend.operations import using_forge_operations, ForgeOperationsWithManualCast, main_stream_worker, weights_manual_cast
+from backend.operations import using_forge_operations, ForgeOperations, main_stream_worker, weights_manual_cast
+
+
+def apply_controlnet_advanced(
+        unet,
+        controlnet,
+        image_bchw,
+        strength,
+        start_percent,
+        end_percent,
+        positive_advanced_weighting=None,
+        negative_advanced_weighting=None,
+        advanced_frame_weighting=None,
+        advanced_sigma_weighting=None,
+        advanced_mask_weighting=None
+):
+    """
+
+    # positive_advanced_weighting or negative_advanced_weighting
+
+    Unet has input, middle, output blocks, and we can give different weights to each layers in all blocks.
+    Below is an example for stronger control in middle block.
+    This is helpful for some high-res fix passes.
+
+        positive_advanced_weighting = {
+            'input': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            'middle': [1.0],
+            'output': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+        }
+        negative_advanced_weighting = {
+            'input': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2],
+            'middle': [1.0],
+            'output': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]
+        }
+
+    # advanced_frame_weighting
+
+    The advanced_frame_weighting is a weight applied to each image in a batch.
+    The length of this list must be same with batch size
+    For example, if batch size is 5, you can use advanced_frame_weighting = [0, 0.25, 0.5, 0.75, 1.0]
+    If you view the 5 images as 5 frames in a video, this will lead to progressively stronger control over time.
+
+    # advanced_sigma_weighting
+
+    The advanced_sigma_weighting allows you to dynamically compute control
+    weights given diffusion timestep (sigma).
+    For example below code can softly make beginning steps stronger than ending steps.
+
+        sigma_max = unet.model.model_sampling.sigma_max
+        sigma_min = unet.model.model_sampling.sigma_min
+        advanced_sigma_weighting = lambda s: (s - sigma_min) / (sigma_max - sigma_min)
+
+    # advanced_mask_weighting
+
+    A mask can be applied to control signals.
+    This should be a tensor with shape B 1 H W where the H and W can be arbitrary.
+    This mask will be resized automatically to match the shape of all injection layers.
+
+    """
+
+    cnet = controlnet.copy().set_cond_hint(image_bchw, strength, (start_percent, end_percent))
+    cnet.positive_advanced_weighting = positive_advanced_weighting
+    cnet.negative_advanced_weighting = negative_advanced_weighting
+    cnet.advanced_frame_weighting = advanced_frame_weighting
+    cnet.advanced_sigma_weighting = advanced_sigma_weighting
+
+    if advanced_mask_weighting is not None:
+        assert isinstance(advanced_mask_weighting, torch.Tensor)
+        B, C, H, W = advanced_mask_weighting.shape
+        assert B > 0 and C == 1 and H > 0 and W > 0
+
+    cnet.advanced_mask_weighting = advanced_mask_weighting
+
+    m = unet.clone()
+    m.add_patched_controlnet(cnet)
+    return m
 
 
 def compute_controlnet_weighting(control, cnet):
@@ -282,7 +357,7 @@ class ControlNet(ControlBase):
         super().cleanup()
 
 
-class ControlLoraOps(ForgeOperationsWithManualCast):
+class ControlLoraOps(ForgeOperations):
     class Linear(torch.nn.Module):
         def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None) -> None:
             super().__init__()
@@ -353,11 +428,17 @@ class ControlLora(ControlNet):
         controlnet_config = model.diffusion_model.config.copy()
         controlnet_config.pop("out_channels")
         controlnet_config["hint_channels"] = self.control_weights["input_hint_block.0.weight"].shape[1]
-        controlnet_config["dtype"] = dtype = model.storage_dtype
+
+        dtype = model.storage_dtype
+
+        if dtype in ['nf4', 'fp4', 'gguf']:
+            dtype = torch.float16
+
+        controlnet_config["dtype"] = dtype
 
         self.manual_cast_dtype = model.computation_dtype
 
-        with using_forge_operations(operations=ControlLoraOps):
+        with using_forge_operations(operations=ControlLoraOps, dtype=dtype):
             self.control_model = cldm.ControlNet(**controlnet_config)
 
         self.control_model.to(device=memory_management.get_torch_device(), dtype=dtype)

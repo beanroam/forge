@@ -270,7 +270,7 @@ def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
     return out_cond, out_uncond
 
 
-def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None, return_full=False):
     edit_strength = sum((item['strength'] if 'strength' in item else 1) for item in cond)
 
     if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
@@ -297,11 +297,14 @@ def sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_
                 "sigma": timestep, "model_options": model_options, "input": x}
         cfg_result = fn(args)
 
+    if return_full:
+        return cfg_result, cond_pred, uncond_pred
+
     return cfg_result
 
 
 def sampling_function(self, denoiser_params, cond_scale, cond_composition):
-    unet_patcher = self.inner_model.forge_objects.unet
+    unet_patcher = self.inner_model.inner_model.forge_objects.unet
     model = unet_patcher.model
     control = unet_patcher.controlnet_linked_list
     extra_concat_condition = unet_patcher.extra_concat_condition
@@ -333,8 +336,8 @@ def sampling_function(self, denoiser_params, cond_scale, cond_composition):
     for modifier in model_options.get('conditioning_modifiers', []):
         model, x, timestep, uncond, cond, cond_scale, model_options, seed = modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
 
-    denoised = sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
-    return denoised
+    denoised, cond_pred, uncond_pred = sampling_function_inner(model, x, timestep, uncond, cond, cond_scale, model_options, seed, return_full=True)
+    return denoised, cond_pred, uncond_pred
 
 
 def sampling_prepare(unet, x):
